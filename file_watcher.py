@@ -1,14 +1,14 @@
+# file_watcher.py
 import asyncio
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy import select
-from models import FileInfo, Subscription, User
+from models import FolderSubscription, User
 from aiogram import Bot
 from config import DATABASE_URL, CHECK_INTERVAL
 from datetime import datetime
 import logging
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -18,101 +18,92 @@ class FileWatcher:
         self.engine = create_async_engine(DATABASE_URL)
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
         self.bot = Bot(token=bot_token)
-        
-    async def check_file_updates(self):
-        """Проверяет обновления файлов и отправляет уведомления"""
+
+    async def check_folder_updates(self):
+        """Проверяет изменения в подписанных папках по last_modified"""
         try:
             async with self.async_session() as session:
-                # Получаем все файлы из БД
-                stmt = select(FileInfo)
-                result = await session.execute(stmt)
-                db_files = result.scalars().all()
-                
-                # Проверяем каждый файл
-                for db_file in db_files:
-                    if os.path.exists(db_file.path):
-                        try:
-                            # Получаем текущую информацию о файле
-                            stat = os.stat(db_file.path)
-                            current_modified = datetime.fromtimestamp(stat.st_mtime)
-                            current_size = stat.st_size
-                            
-                            # Проверяем, изменился ли файл
-                            if (db_file.last_modified != current_modified or 
-                                db_file.size != current_size):
-                                
-                                # Сохраняем старую дату для уведомления
-                                old_modified = db_file.last_modified
-                                
-                                # Обновляем информацию в БД
-                                db_file.last_modified = current_modified
-                                db_file.size = current_size
-                                
-                                # Отправляем уведомления подписчикам
-                                await self.notify_subscribers(session, db_file, old_modified)
-                                
-                        except OSError as e:
-                            logger.warning(f"Ошибка при проверке файла {db_file.path}: {e}")
-                
-                # Сохраняем изменения
-                await session.commit()
-                
-        except Exception as e:
-            logger.error(f"Ошибка при проверке обновлений файлов: {e}")
-    
-    async def notify_subscribers(self, session, file_info: FileInfo, old_modified: datetime):
-        """Отправляет уведомления подписчикам об изменении файла"""
-        try:
-            # Получаем подписчиков файла
-            stmt = select(Subscription).where(Subscription.file_path == file_info.path)
-            result = await session.execute(stmt)
-            subscriptions = result.scalars().all()
-            
-            # Получаем информацию о пользователях
-            user_ids = [sub.user_id for sub in subscriptions]
-            if not user_ids:
-                return
-                
-            stmt = select(User).where(User.id.in_(user_ids))
-            result = await session.execute(stmt)
-            users = result.scalars().all()
-            users_dict = {user.id: user.tg_id for user in users}
-            
-            # Отправляем уведомления
-            for subscription in subscriptions:
-                tg_user_id = users_dict.get(subscription.user_id)
-                if tg_user_id:
+                result = await session.execute(select(FolderSubscription))
+                subscriptions = result.scalars().all()
+
+                for sub in subscriptions:
+                    folder_path = sub.folder_path
+                    if not os.path.exists(folder_path):
+                        continue
+
                     try:
-                        message = (
-                            f"🔔 Обновление файла!\n\n"
-                            f"📁 Файл: <code>{file_info.filename}</code>\n"
-                            f"🔢 Заказ: {file_info.order}\n"
-                            f"🏗 Стадия: {file_info.stage}\n"
-                            f"📝 Задание: {file_info.task}\n\n"
-                            f"🕒 Время изменения: {file_info.last_modified.strftime('%d.%m.%Y %H:%M')}"
-                        )
-                        await self.bot.send_message(chat_id=tg_user_id, text=message)
+                        stat = os.stat(folder_path)
+                        current_mtime = datetime.fromtimestamp(stat.st_mtime)
                     except Exception as e:
-                        logger.error(f"Ошибка отправки сообщения пользователю {tg_user_id}: {e}")
-                        
+                        logger.warning(f"Не удалось прочитать статус папки {folder_path}: {e}")
+                        continue
+
+                    # Если first check — просто сохраним время
+                    if sub.last_modified is None:
+                        sub.last_modified = current_mtime
+                        await session.commit()
+                        logger.info(f"Инициализировано last_modified для {folder_path}")
+                        continue
+
+                    # Проверяем, изменилась ли папка
+                    if current_mtime > sub.last_modified:
+                        logger.info(f"Обнаружено изменение в папке: {folder_path}")
+                        sub.last_modified = current_mtime
+                        await session.commit()  # ← ОБЯЗАТЕЛЬНО СОХРАНЯЕМ
+                        await self.notify_subscribers(session, sub, folder_path, current_mtime)
+
         except Exception as e:
-            logger.error(f"Ошибка при отправке уведомлений: {e}")
-    
+            logger.error(f"Ошибка при проверке обновлений папок: {e}")
+
+    async def notify_subscribers(self, session, sub: FolderSubscription, folder_path: str, current_mtime: datetime):
+        """Отправляет уведомление подписчику"""
+        try:
+            stmt = select(User).where(User.id == sub.user_id)
+            result = await session.execute(stmt)
+            user = result.scalar_one_or_none()
+            if not user:
+                return
+
+            folder_name = os.path.basename(folder_path)
+            parent_path = os.path.dirname(folder_path)
+            task_name = os.path.basename(parent_path)
+            stage_name = os.path.basename(os.path.dirname(parent_path))
+            order_name = os.path.basename(os.path.dirname(os.path.dirname(parent_path)))
+
+            message = (
+                "🔄 <b>Обновление в папке!</b>\n\n"
+                f"📁 <code>{folder_name}</code>\n"
+                f"📦 Задание: <b>{task_name}</b>\n"
+                f"🔧 Стадия: {stage_name}\n"
+                f"📋 Заказ: {order_name}\n\n"
+                f"🕒 Изменено: {current_mtime.strftime('%d.%m.%Y %H:%M')}"
+            )
+
+            await self.bot.send_message(
+                chat_id=user.tg_id,
+                text=message,
+                parse_mode="HTML"
+            )
+            logger.info(f"✅ Уведомление отправлено пользователю {user.tg_id} о папке {folder_name}")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки уведомления: {e}")
+
     async def start_monitoring(self):
-        """Запускает мониторинг файлов"""
-        logger.info("🚀 Запуск мониторинга файлов...")
+        """Запуск постоянного мониторинга"""
+        logger.info("🚀 Запуск мониторинга подписанных папок...")
         while True:
             try:
-                await self.check_file_updates()
+                await self.check_folder_updates()
                 await asyncio.sleep(CHECK_INTERVAL)
             except asyncio.CancelledError:
-                logger.info("🛑 Мониторинг файлов остановлен")
+                logger.info("🛑 Мониторинг остановлен.")
                 break
             except Exception as e:
-                logger.error(f"Ошибка в цикле мониторинга: {e}")
+                logger.error(f"❌ Ошибка в цикле мониторинга: {e}")
                 await asyncio.sleep(CHECK_INTERVAL)
-    
+
     async def close(self):
-        """Закрывает соединения"""
+        """Закрытие ресурсов"""
         await self.bot.session.close()
         await self.engine.dispose()

@@ -1,22 +1,17 @@
-from sqlalchemy import Column, Integer, BigInteger, String, Text, DateTime, Index
+from sqlalchemy import Integer, BigInteger, String, Text, DateTime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from datetime import datetime
-import os
 from config import DATABASE_URL
 
-# Создание движка для SQLite
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
-# Базовый класс
 class Base(AsyncAttrs, DeclarativeBase):
     pass
 
-# Таблица пользователей
 class User(Base):
     __tablename__ = "users"
-    
     id: Mapped[int] = mapped_column(primary_key=True)
     tg_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     username: Mapped[str] = mapped_column(String(255), nullable=True, index=True)
@@ -24,29 +19,27 @@ class User(Base):
     last_name: Mapped[str] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-# Таблица файлов
-class FileInfo(Base):
-    __tablename__ = "files"
-    
-    id: Mapped[int] = mapped_column(primary_key=True)
-    order: Mapped[str] = mapped_column(String(50), index=True)
-    stage: Mapped[str] = mapped_column(String(50), index=True)
-    task: Mapped[str] = mapped_column(String(100), index=True)
-    filename: Mapped[str] = mapped_column(String(255), index=True)
-    path: Mapped[str] = mapped_column(Text, unique=True, index=True)
-    last_modified: Mapped[datetime] = mapped_column(DateTime, index=True)
-    size: Mapped[int] = mapped_column(Integer, default=0)
+#class FileInfo(Base):
+#    __tablename__ = "files"
+ #   id: Mapped[int] = mapped_column(primary_key=True)
+ #   order: Mapped[str] = mapped_column(String)
+ #   stage: Mapped[str] = mapped_column(String)
+#    task: Mapped[str] = mapped_column(String)
+#    foldername: Mapped[str] = mapped_column(String)
+ #   path: Mapped[str] = mapped_column(String, unique=True)
+ #   hash: Mapped[str] = mapped_column(String, nullable=True)
 
-# Таблица подписок
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-    
+
+class FolderSubscription(Base):
+    __tablename__ = "folder_subscriptions"
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(Integer, index=True)
-    file_path: Mapped[str] = mapped_column(Text, index=True)
+    folder_path: Mapped[str] = mapped_column(Text, index=True)
+    last_modified: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-# Функция инициализации БД
+
+
 async def init_db():
     """Инициализация базы данных - создание всех таблиц"""
     try:

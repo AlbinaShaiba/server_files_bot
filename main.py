@@ -10,32 +10,25 @@ from handlers import get_handlers_router
 from middleware import DatabaseMiddleware
 from file_watcher import FileWatcher
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
 async def main():
     try:
-        # Создаем директорию для файлов если её нет
         os.makedirs(FILES_ROOT, exist_ok=True)
         print(f"📂 Рабочая директория: {FILES_ROOT}")
         
-        # Инициализация базы данных SQLite
         await init_db()
         
-        # Создание бота и диспетчера
         bot = Bot(
             token=BOT_TOKEN,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML)
         )
         dp = Dispatcher()
         
-        # Регистрация middleware
         dp.update.middleware(DatabaseMiddleware())
         
-        # Регистрация роутеров
         dp.include_router(get_handlers_router())
         
-        # Создание file watcher
         file_watcher = FileWatcher(BOT_TOKEN)
         
         # Запуск мониторинга в отдельной задаче

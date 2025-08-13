@@ -1,9 +1,10 @@
 import os
+import re
 import asyncio
 from datetime import datetime, timedelta
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select, delete
 from models import User, FolderSubscription, async_session
@@ -11,13 +12,21 @@ from config import FILES_ROOT, CHECK_INTERVAL
 
 router = Router()
 ITEMS_PER_PAGE = 6  # Кол-во проектов/подписок на странице
-
+MAX_CALLBACK_LEN = 64
 
 def paginate_items(items, page):
     start = (page - 1) * ITEMS_PER_PAGE
     end = start + ITEMS_PER_PAGE
     return items[start:end], len(items)
 
+def make_safe_callback(data: str) -> str:
+    """Превращаем любые данные в безопасный callback для Telegram."""
+    safe_data = re.sub(r'[^a-zA-Z0-9_-]', '_', data)
+    encoded = safe_data.encode('utf-8')
+    if len(encoded) > MAX_CALLBACK_LEN:
+        encoded = encoded[:MAX_CALLBACK_LEN]
+        safe_data = encoded.decode('utf-8', errors='ignore')
+    return safe_data
 
 # ---------------- Start / Menu ----------------
 
@@ -61,7 +70,7 @@ async def show_projects_page(message_or_callback, state):
     page_items, total = paginate_items(projects, page)
     kb = InlineKeyboardBuilder()
     for proj in page_items:
-        kb.button(text=proj, callback_data=f"proj:{proj}")
+        kb.button(text=proj, callback_data=f"proj:{make_safe_callback(proj)}")
 
     if page > 1:
         kb.button(text="⬅️ Назад", callback_data="page_prev")
@@ -103,7 +112,7 @@ async def project_selected(callback: CallbackQuery, state):
 
     kb = InlineKeyboardBuilder()
     for st in stages:
-        kb.button(text=st, callback_data=f"stage:{st}")
+        kb.button(text=st, callback_data=f"stage:{make_safe_callback(st)}")
     kb.adjust(2)
     await callback.message.edit_text("Выберите стадию:", reply_markup=kb.as_markup())
     await callback.answer()
@@ -124,7 +133,7 @@ async def stage_selected(callback: CallbackQuery, state):
 
     kb = InlineKeyboardBuilder()
     for t in tasks:
-        kb.button(text=t, callback_data=f"task:{t}")
+        kb.button(text=t, callback_data=f"task:{make_safe_callback(t)}")
     kb.adjust(2)
     await callback.message.edit_text("Выберите задание:", reply_markup=kb.as_markup())
     await callback.answer()
@@ -191,7 +200,7 @@ async def show_subs_page(message_or_callback, state):
     page_items, total = paginate_items(subs, page)
     kb = InlineKeyboardBuilder()
     for s in page_items:
-        kb.button(text=f"❌ {s}", callback_data=f"delete_sub:{s}")
+        kb.button(text=f"❌ {s}", callback_data=f"delete_sub:{make_safe_callback(s)}")
 
     if page > 1:
         kb.button(text="⬅️ Назад", callback_data="subs_page_prev")

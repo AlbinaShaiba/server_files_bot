@@ -1,393 +1,246 @@
-# handlers.py
-from aiogram import Router, F
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from models import User, FolderSubscription
 import os
-from config import FILES_ROOT
+import asyncio
+from datetime import datetime, timedelta
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy import select
+from models import User, FolderSubscription, async_session
+from config import FILES_ROOT, CHECK_INTERVAL
 
 router = Router()
-ITEMS_PER_PAGE = 6
+ITEMS_PER_PAGE = 6  # Кол-во проектов на странице
 
 
-class SubscribeState(StatesGroup):
-    order = State()
-    stage = State()
-    task = State()
-
-
-# Клавиатура с командами
-main_menu_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="/subscribe")],
-        [KeyboardButton(text="/my_subs")],
-    ],
-    resize_keyboard=True
-)
-
-
-async def get_or_create_user(session: AsyncSession, user_data) -> User:
-    """Получает или создаёт пользователя в БД"""
-    stmt = select(User).where(User.tg_id == user_data.id)
-    result = await session.execute(stmt)
-    user = result.scalar_one_or_none()
-
-    if not user:
-        user = User(
-            tg_id=user_data.id,
-            username=user_data.username,
-            first_name=user_data.first_name,
-            last_name=user_data.last_name
-        )
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
-        print(f"➕ Новый пользователь: {user_data.full_name} (@{user_data.username})")
-    else:
-        # Обновляем данные
-        user.username = user_data.username
-        user.first_name = user_data.first_name
-        user.last_name = user_data.last_name
-        session.add(user)
-        await session.commit()
-    return user
+def paginate_items(items, page):
+    start = (page - 1) * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    return items[start:end], len(items)
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, session: AsyncSession):
-    user = await get_or_create_user(session, message.from_user)
-
+async def cmd_start(message: Message):
     await message.answer(
-        f"👋 Привет, {user.first_name}!\n\n"
-        "Я бот для отслеживания изменений в папках на сервере.\n"
-        "Доступные команды:\n"
-        "📁 /subscribe — подписаться на папку\n"
-        "📋 /my_subs — посмотреть и управлять подписками",
-        reply_markup=main_menu_kb
+        "Привет! 👋\n"
+        "Я могу уведомлять вас об изменениях в папках Задание.\n"
+        "Используйте /subscribe, чтобы подписаться на папку."
     )
 
 
 @router.message(Command("subscribe"))
-async def start_subscription(message: Message, state: FSMContext, session: AsyncSession):
-    await state.clear()
-    user = await get_or_create_user(session, message.from_user)
-
-    if not os.path.exists(FILES_ROOT):
-        await message.answer("❌ Директория с файлами не найдена. Проверьте настройки.")
+async def cmd_subscribe(message: Message, state):
+    """Начало подписки: показывает список проектов с пагинацией."""
+    projects = sorted([d for d in os.listdir(FILES_ROOT) if os.path.isdir(os.path.join(FILES_ROOT, d))])
+    if not projects:
+        await message.answer("❌ Нет доступных проектов.")
         return
 
-    # Получаем список проектов (первый уровень)
-    orders = []
-    try:
-        for item in os.listdir(FILES_ROOT):
-            item_path = os.path.join(FILES_ROOT, item)
-            if os.path.isdir(item_path):
-                orders.append(item)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка при чтении директории: {e}")
-        return
-
-    if not orders:
-        await message.answer("📭 Нет доступных проектов.")
-        return
-
-    await show_orders_page(message, sorted(orders), 0, state)
+    await state.update_data(projects=projects, page=1)
+    await show_projects_page(message, state)
 
 
-async def show_orders_page(message: Message, orders: list, page: int, state: FSMContext):
-    total_pages = (len(orders) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-    start_idx = page * ITEMS_PER_PAGE
-    end_idx = min(start_idx + ITEMS_PER_PAGE, len(orders))
-    current_orders = orders[start_idx:end_idx]
+async def show_projects_page(message_or_callback, state):
+    """Отображает текущую страницу проектов."""
+    data = await state.get_data()
+    page = data["page"]
+    projects = data["projects"]
 
+    page_items, total = paginate_items(projects, page)
     kb = InlineKeyboardBuilder()
-    for order in current_orders:
-        kb.button(text=order, callback_data=f"order:{order}")
-    pagination_row = []
-    if page > 0:
-        pagination_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"orders_page:{page-1}"))
-    if page < total_pages - 1:
-        pagination_row.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"orders_page:{page+1}"))
-    if pagination_row:
-        kb.row(*pagination_row)
+    for proj in page_items:
+        kb.button(text=proj, callback_data=f"proj:{proj}")
+
+    if page > 1:
+        kb.button(text="⬅️ Назад", callback_data="page_prev")
+    if page * ITEMS_PER_PAGE < total:
+        kb.button(text="➡️ Вперёд", callback_data="page_next")
+
     kb.adjust(2)
-
-    page_info = f" (страница {page+1}/{total_pages})" if total_pages > 1 else ""
-    await message.answer(f"📁 Выберите проект{page_info}:", reply_markup=kb.as_markup())
-    await state.set_state(SubscribeState.order)
-
-
-@router.callback_query(lambda c: c.data.startswith("orders_page:"))
-async def handle_orders_pagination(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    page = int(callback.data.split(":")[1])
-    orders = []
-    try:
-        for item in os.listdir(FILES_ROOT):
-            item_path = os.path.join(FILES_ROOT, item)
-            if os.path.isdir(item_path):
-                orders.append(item)
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Ошибка: {e}")
-        return
-
-    await callback.message.delete()
-    await show_orders_page(callback.message, sorted(orders), page, state)
+    text = "Выберите проект:"
+    if isinstance(message_or_callback, Message):
+        await message_or_callback.answer(text, reply_markup=kb.as_markup())
+    elif isinstance(message_or_callback, CallbackQuery):
+        await message_or_callback.message.edit_text(text, reply_markup=kb.as_markup())
 
 
-@router.callback_query(lambda c: c.data.startswith("order:"))
-async def select_order(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    order = callback.data.split(":", 1)[1]
-    await state.update_data(order=order)
-    order_path = os.path.join(FILES_ROOT, order)
-
-    if not os.path.exists(order_path):
-        await callback.message.edit_text("❌ Папка проекта не найдена.")
-        return
-
-    # Получаем стадии
-    stages = []
-    try:
-        for item in os.listdir(order_path):
-            item_path = os.path.join(order_path, item)
-            if os.path.isdir(item_path):
-                stages.append(item)
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Ошибка при чтении стадий: {e}")
-        return
-
-    if not stages:
-        await callback.message.edit_text("📭 Нет стадий в этом проекте.")
-        return
-
-    await state.update_data(stages_list=stages)
-    await show_stages_page(callback.message, stages, 0, state)
+@router.callback_query(F.data.startswith("page_"))
+async def paginate_callback(callback: CallbackQuery, state):
+    data = await state.get_data()
+    page = data.get("page", 1)
+    if callback.data == "page_prev":
+        page -= 1
+    elif callback.data == "page_next":
+        page += 1
+    await state.update_data(page=page)
+    await callback.answer()
+    await show_projects_page(callback, state)
 
 
-async def show_stages_page(message: Message, stages: list, page: int, state: FSMContext):
-    total_pages = (len(stages) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-    start_idx = page * ITEMS_PER_PAGE
-    end_idx = min(start_idx + ITEMS_PER_PAGE, len(stages))
-    current_stages = sorted(stages)[start_idx:end_idx]
+@router.callback_query(F.data.startswith("proj:"))
+async def project_selected(callback: CallbackQuery, state):
+    project = callback.data.split("proj:")[1]
+    await state.update_data(selected_project=project)
 
+    # Показать стадии
+    stages_path = os.path.join(FILES_ROOT, project)
+    stages = sorted([d for d in os.listdir(stages_path) if os.path.isdir(os.path.join(stages_path, d))])
     kb = InlineKeyboardBuilder()
-    for stage in current_stages:
-        kb.button(text=stage, callback_data=f"stage:{stage}")
-    pagination_row = []
-    if page > 0:
-        pagination_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"stages_page:{page-1}"))
-    if page < total_pages - 1:
-        pagination_row.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"stages_page:{page+1}"))
-    if pagination_row:
-        kb.row(*pagination_row)
+    for st in stages:
+        kb.button(text=st, callback_data=f"stage:{st}")
     kb.adjust(2)
+    await callback.message.edit_text("Выберите стадию:", reply_markup=kb.as_markup())
+    await callback.answer()
 
-    page_info = f" (страница {page+1}/{total_pages})" if total_pages > 1 else ""
-    await message.edit_text(f"🔧 Выберите стадию{page_info}:", reply_markup=kb.as_markup())
 
-
-@router.callback_query(lambda c: c.data.startswith("stages_page:"))
-async def handle_stages_pagination(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    page = int(callback.data.split(":")[1])
+@router.callback_query(F.data.startswith("stage:"))
+async def stage_selected(callback: CallbackQuery, state):
+    stage = callback.data.split("stage:")[1]
     data = await state.get_data()
-    stages = data.get("stages_list", [])
-    await show_stages_page(callback.message, stages, page, state)
+    await state.update_data(selected_stage=stage)
 
-
-@router.callback_query(lambda c: c.data.startswith("stage:"))
-async def select_stage(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    stage = callback.data.split(":", 1)[1]
-    await state.update_data(stage=stage)
-    data = await state.get_data()
-    stage_path = os.path.join(FILES_ROOT, data["order"], stage)
-
-    if not os.path.exists(stage_path):
-        await callback.message.edit_text("❌ Папка стадии не найдена.")
-        return
-
-    # Получаем папки-задания (например, Задание АР, КЖ и т.д.)
-    tasks = []
-    try:
-        for item in os.listdir(stage_path):
-            item_path = os.path.join(stage_path, item)
-            if os.path.isdir(item_path):
-                tasks.append(item)
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Ошибка при чтении заданий: {e}")
-        return
-
-    if not tasks:
-        await callback.message.edit_text("📭 Нет заданий в этой стадии.")
-        return
-
-    await state.update_data(tasks_list=tasks)
-    await show_tasks_page(callback.message, tasks, 0, state)
-
-
-async def show_tasks_page(message: Message, tasks: list, page: int, state: FSMContext):
-    total_pages = (len(tasks) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-    start_idx = page * ITEMS_PER_PAGE
-    end_idx = min(start_idx + ITEMS_PER_PAGE, len(tasks))
-    current_tasks = sorted(tasks)[start_idx:end_idx]
-
+    # Показать задания
+    tasks_path = os.path.join(FILES_ROOT, data["selected_project"], stage)
+    tasks = sorted([d for d in os.listdir(tasks_path) if os.path.isdir(os.path.join(tasks_path, d))])
     kb = InlineKeyboardBuilder()
-    for task in current_tasks:
-        kb.button(text=f"📁 {task}", callback_data=f"task:{task}")
-    pagination_row = []
-    if page > 0:
-        pagination_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"tasks_page:{page-1}"))
-    if page < total_pages - 1:
-        pagination_row.append(InlineKeyboardButton(text="Далее ➡️", callback_data=f"tasks_page:{page+1}"))
-    if pagination_row:
-        kb.row(*pagination_row)
-    kb.adjust(1)
-
-    page_info = f" (страница {page+1}/{total_pages})" if total_pages > 1 else ""
-    await message.edit_text(f"📌 Выберите задание{page_info}:", reply_markup=kb.as_markup())
-    await state.set_state(SubscribeState.task)
+    for t in tasks:
+        kb.button(text=t, callback_data=f"task:{t}")
+    kb.adjust(2)
+    await callback.message.edit_text("Выберите задание:", reply_markup=kb.as_markup())
+    await callback.answer()
 
 
-@router.callback_query(lambda c: c.data.startswith("tasks_page:"))
-async def handle_tasks_pagination(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    page = int(callback.data.split(":")[1])
+@router.callback_query(F.data.startswith("task:"))
+async def task_selected(callback: CallbackQuery, state):
+    task = callback.data.split("task:")[1]
     data = await state.get_data()
-    tasks = data.get("tasks_list", [])
-    await show_tasks_page(callback.message, tasks, page, state)
+    project, stage = data["selected_project"], data["selected_stage"]
+    folder_path = os.path.join(project, stage, task)
 
+    # Сохраняем подписку в БД
+    async with async_session() as session:
+        user_result = await session.execute(select(User).where(User.tg_id == callback.from_user.id))
+        user = user_result.scalar_one_or_none()
+        if not user:
+            user = User(tg_id=callback.from_user.id)
+            session.add(user)
+            await session.commit()
 
-@router.callback_query(lambda c: c.data.startswith("task:"))
-async def select_task(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    task = callback.data.split(":", 1)[1]
-    data = await state.get_data()
-    task_path = os.path.join(FILES_ROOT, data["order"], data["stage"], task)
-
-    if not os.path.exists(task_path) or not os.path.isdir(task_path):
-        await callback.message.edit_text("❌ Папка не найдена.")
-        return
-
-    # Сохраняем относительный путь
-    relative_path = os.path.relpath(task_path, FILES_ROOT)
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Подписаться", callback_data="confirm_subscribe")
-    kb.adjust(1)
-
-    await state.update_data(
-        task=task,
-        task_path=relative_path
-    )
+        sub_result = await session.execute(
+            select(FolderSubscription).where(FolderSubscription.user_id == user.id,
+                                            FolderSubscription.folder_path == folder_path)
+        )
+        subscription = sub_result.scalar_one_or_none()
+        if not subscription:
+            subscription = FolderSubscription(user_id=user.id, folder_path=folder_path)
+            session.add(subscription)
+            await session.commit()
 
     await callback.message.edit_text(
-        f"Вы выбрали папку:\n"
-        f"<b>{task}</b>\n\n"
-        f"Подпишитесь, чтобы получать уведомления при любых изменениях внутри.",
-        parse_mode="HTML",
-        reply_markup=kb.as_markup()
-    )
-
-
-@router.callback_query(lambda c: c.data == "confirm_subscribe")
-async def confirm_subscribe(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    user = await get_or_create_user(session, callback.from_user)
-    data = await state.get_data()
-    relative_path = data["task_path"]
-    task_name = data["task"]
-
-    # Проверяем, нет ли уже такой подписки
-    stmt = select(FolderSubscription).where(
-        FolderSubscription.user_id == user.id,
-        FolderSubscription.folder_path == relative_path
-    )
-    result = await session.execute(stmt)
-    sub = result.scalar_one_or_none()
-
-    if not sub:
-        new_sub = FolderSubscription(
-            user_id=user.id,
-            folder_path=relative_path,
-            last_modified=None
-        )
-        session.add(new_sub)
-        await session.commit()
-        await callback.message.edit_text(
-            f"✅ Вы успешно подписаны на папку:\n"
-            f"<code>{task_name}</code>\n\n"
-            f"Теперь вы будете получать уведомления о любых изменениях внутри.",
-            parse_mode="HTML"
-        )
-    else:
-        await callback.message.edit_text(
-            f"ℹ️ Вы уже подписаны на <code>{task_name}</code>.",
-            parse_mode="HTML"
-        )
-
-    await state.clear()
-
-
-@router.message(Command("my_subs"))
-async def my_subscriptions(message: Message, session: AsyncSession):
-    user = await get_or_create_user(session, message.from_user)
-
-    stmt = select(FolderSubscription).where(FolderSubscription.user_id == user.id)
-    result = await session.execute(stmt)
-    subs = result.scalars().all()
-
-    if not subs:
-        await message.answer("📭 У вас нет активных подписок.")
-        return
-
-    kb = InlineKeyboardBuilder()
-    for sub in subs:
-        try:
-            rel_path = os.path.relpath(sub.folder_path, "")
-            parts = rel_path.split(os.sep)
-            display_name = f"{parts[0]}/{parts[1]}/<b>{parts[2]}</b>"
-        except Exception:
-            display_name = f"<code>{sub.folder_path}</code>"
-
-        kb.button(
-            text=f"🗑️ Удалить: {os.path.basename(sub.folder_path)}",
-            callback_data=f"delete_sub:{sub.id}"
-        )
-    kb.adjust(1)
-
-    await message.answer(
-        "📋 <b>Ваши подписки:</b>\n\n"
-        "Нажмите на кнопку, чтобы удалить подписку.",
-        reply_markup=kb.as_markup(),
+        f"✅ Теперь вы будете получать уведомления о любых изменениях в папке Задание:\n<code>{folder_path}</code>",
         parse_mode="HTML"
     )
+    await callback.answer()
 
 
-@router.callback_query(lambda c: c.data.startswith("delete_sub:"))
-async def delete_subscription(callback: CallbackQuery, session: AsyncSession):
-    try:
-        sub_id = int(callback.data.split(":", 1)[1])
-        user = await get_or_create_user(session, callback.from_user)
+# ---------------- Monitoring ----------------
 
-        stmt = select(FolderSubscription).where(
-            FolderSubscription.id == sub_id,
-            FolderSubscription.user_id == user.id
-        )
-        result = await session.execute(stmt)
-        sub = result.scalar_one_or_none()
+class FileWatcher:
+    def __init__(self, bot):
+        self.bot = bot
 
-        if not sub:
-            await callback.answer("❌ Подписка не найдена.")
-            return
+    def get_full_path(self, relative_path: str) -> str:
+        return os.path.join(FILES_ROOT, relative_path)
 
-        folder_name = os.path.basename(sub.folder_path)
-        await session.delete(sub)
-        await session.commit()
+    def get_folder_mtime_recursive(self, folder_path: str) -> float:
+        if not os.path.exists(folder_path):
+            return 0.0
+        latest = 0.0
+        for root, _, files in os.walk(folder_path):
+            try:
+                mtime = os.path.getmtime(root)
+                if mtime > latest:
+                    latest = mtime
+            except OSError:
+                pass
+            for file in files:
+                try:
+                    mtime = os.path.getmtime(os.path.join(root, file))
+                    if mtime > latest:
+                        latest = mtime
+                except OSError:
+                    pass
+        return latest
 
-        await callback.message.edit_text(
-            f"✅ Подписка на папку <code>{folder_name}</code> удалена.",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Ошибка при удалении: {e}")
+    async def notify_subscribers(self, sub, changed_folder, current_mtime):
+        try:
+            async with async_session() as session:
+                result = await session.execute(select(User).where(User.id == sub.user_id))
+                user = result.scalar_one_or_none()
+                if not user:
+                    return
+
+            # Добавляем +1 час
+            current_mtime += timedelta(hours=1)
+
+            rel_path = os.path.relpath(changed_folder, FILES_ROOT)
+            message = (
+                "🔄 <b>Обнаружено изменение в папке Задание!</b>\n\n"
+                f"📌 Путь: <code>{rel_path}</code>\n"
+                f"🕒 Время изменения: {current_mtime.strftime('%d.%m.%Y %H:%M')}\n"
+                f"💬 Вы подписаны на это задание."
+            )
+
+            await self.bot.send_message(user.tg_id, message, parse_mode="HTML")
+
+        except Exception as e:
+            print("Ошибка уведомления:", e)
+
+    async def check_folder_updates(self):
+        async with async_session() as session:
+            result = await session.execute(select(FolderSubscription))
+            subscriptions = result.scalars().all()
+
+            for sub in subscriptions:
+                task_full_path = self.get_full_path(sub.folder_path)
+                if not os.path.exists(task_full_path):
+                    continue
+                subfolders = [d for d in os.listdir(task_full_path) if os.path.isdir(os.path.join(task_full_path, d))]
+
+                latest_mtime = 0.0
+                changed_folder = None
+                for sf in subfolders:
+                    data_path = os.path.join(task_full_path, sf, "Data")
+                    if not os.path.isdir(data_path):
+                        continue
+                    mtime = self.get_folder_mtime_recursive(data_path)
+                    if mtime > latest_mtime:
+                        latest_mtime = mtime
+                        changed_folder = os.path.join(task_full_path, sf)
+
+                if latest_mtime == 0.0:
+                    continue
+
+                current_mtime = datetime.fromtimestamp(latest_mtime)
+                if sub.last_modified is None:
+                    sub.last_modified = current_mtime
+                    session.add(sub)
+                    await session.commit()
+                    continue
+
+                if latest_mtime > sub.last_modified.timestamp():
+                    sub.last_modified = current_mtime
+                    session.add(sub)
+                    await session.commit()
+                    await self.notify_subscribers(sub, changed_folder, current_mtime)
+
+    async def start_monitoring(self):
+        while True:
+            try:
+                await self.check_folder_updates()
+                await asyncio.sleep(CHECK_INTERVAL)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print("Ошибка мониторинга:", e)
+                await asyncio.sleep(CHECK_INTERVAL)

@@ -3,14 +3,14 @@ import asyncio
 from datetime import datetime, timedelta
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from models import User, FolderSubscription, async_session
 from config import FILES_ROOT, CHECK_INTERVAL
 
 router = Router()
-ITEMS_PER_PAGE = 6  # Кол-во проектов на странице
+ITEMS_PER_PAGE = 6  # Кол-во проектов/подписок на странице
 
 
 def paginate_items(items, page):
@@ -19,18 +19,31 @@ def paginate_items(items, page):
     return items[start:end], len(items)
 
 
+# ---------------- Start / Menu ----------------
+
 @router.message(Command("start"))
 async def cmd_start(message: Message):
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="/subscribe")],
+            [KeyboardButton(text="/my_subs")]
+        ],
+        resize_keyboard=True
+    )
+    user = message.from_user
     await message.answer(
-        "Привет! 👋\n"
-        "Я могу уведомлять вас об изменениях в папках Задание.\n"
-        "Используйте /subscribe, чтобы подписаться на папку."
+        f"👋 Привет, {user.first_name}!\n\n"
+        "Я бот для отслеживания изменений в папках на сервере выдачи заданий.\n"
+        "Доступные команды:\n"
+        "📁 /subscribe — подписаться на папку\n"
+        "📋 /my_subs — посмотреть и управлять подписками"
     )
 
 
+# ---------------- Subscribe ----------------
+
 @router.message(Command("subscribe"))
 async def cmd_subscribe(message: Message, state):
-    """Начало подписки: показывает список проектов с пагинацией."""
     projects = sorted([d for d in os.listdir(FILES_ROOT) if os.path.isdir(os.path.join(FILES_ROOT, d))])
     if not projects:
         await message.answer("❌ Нет доступных проектов.")
@@ -41,7 +54,6 @@ async def cmd_subscribe(message: Message, state):
 
 
 async def show_projects_page(message_or_callback, state):
-    """Отображает текущую страницу проектов."""
     data = await state.get_data()
     page = data["page"]
     projects = data["projects"]
@@ -82,9 +94,13 @@ async def project_selected(callback: CallbackQuery, state):
     project = callback.data.split("proj:")[1]
     await state.update_data(selected_project=project)
 
-    # Показать стадии
     stages_path = os.path.join(FILES_ROOT, project)
     stages = sorted([d for d in os.listdir(stages_path) if os.path.isdir(os.path.join(stages_path, d))])
+    if not stages:
+        await callback.message.edit_text("❌ Нет доступных стадий для проекта.")
+        await callback.answer()
+        return
+
     kb = InlineKeyboardBuilder()
     for st in stages:
         kb.button(text=st, callback_data=f"stage:{st}")
@@ -99,9 +115,13 @@ async def stage_selected(callback: CallbackQuery, state):
     data = await state.get_data()
     await state.update_data(selected_stage=stage)
 
-    # Показать задания
     tasks_path = os.path.join(FILES_ROOT, data["selected_project"], stage)
     tasks = sorted([d for d in os.listdir(tasks_path) if os.path.isdir(os.path.join(tasks_path, d))])
+    if not tasks:
+        await callback.message.edit_text("❌ Нет доступных заданий для стадии.")
+        await callback.answer()
+        return
+
     kb = InlineKeyboardBuilder()
     for t in tasks:
         kb.button(text=t, callback_data=f"task:{t}")
@@ -117,7 +137,6 @@ async def task_selected(callback: CallbackQuery, state):
     project, stage = data["selected_project"], data["selected_stage"]
     folder_path = os.path.join(project, stage, task)
 
-    # Сохраняем подписку в БД
     async with async_session() as session:
         user_result = await session.execute(select(User).where(User.tg_id == callback.from_user.id))
         user = user_result.scalar_one_or_none()
@@ -137,10 +156,92 @@ async def task_selected(callback: CallbackQuery, state):
             await session.commit()
 
     await callback.message.edit_text(
-        f"✅ Теперь вы будете получать уведомления о любых изменениях в папке Задание:\n<code>{folder_path}</code>",
+        f"✅ Теперь вы будете получать уведомления о любых изменениях в папке:\n<code>{folder_path}</code>",
         parse_mode="HTML"
     )
     await callback.answer()
+
+
+# ---------------- My Subs ----------------
+
+@router.message(Command("my_subs"))
+async def cmd_my_subs(message: Message, state):
+    async with async_session() as session:
+        user_result = await session.execute(select(User).where(User.tg_id == message.from_user.id))
+        user = user_result.scalar_one_or_none()
+        if not user:
+            await message.answer("❌ У вас нет подписок.")
+            return
+        result = await session.execute(select(FolderSubscription).where(FolderSubscription.user_id == user.id))
+        subs = [s.folder_path for s in result.scalars().all()]
+
+    if not subs:
+        await message.answer("❌ У вас нет подписок.")
+        return
+
+    await state.update_data(subs=subs, page=1)
+    await show_subs_page(message, state)
+
+
+async def show_subs_page(message_or_callback, state):
+    data = await state.get_data()
+    page = data["page"]
+    subs = data["subs"]
+
+    page_items, total = paginate_items(subs, page)
+    kb = InlineKeyboardBuilder()
+    for s in page_items:
+        kb.button(text=f"❌ {s}", callback_data=f"delete_sub:{s}")
+
+    if page > 1:
+        kb.button(text="⬅️ Назад", callback_data="subs_page_prev")
+    if page * ITEMS_PER_PAGE < total:
+        kb.button(text="➡️ Вперёд", callback_data="subs_page_next")
+
+    kb.adjust(1)
+    text = "Ваши подписки (нажмите для удаления):"
+    if isinstance(message_or_callback, Message):
+        await message_or_callback.answer(text, reply_markup=kb.as_markup())
+    elif isinstance(message_or_callback, CallbackQuery):
+        await message_or_callback.message.edit_text(text, reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("subs_page_"))
+async def subs_paginate_callback(callback: CallbackQuery, state):
+    data = await state.get_data()
+    page = data.get("page", 1)
+    if callback.data == "subs_page_prev":
+        page -= 1
+    elif callback.data == "subs_page_next":
+        page += 1
+    await state.update_data(page=page)
+    await callback.answer()
+    await show_subs_page(callback, state)
+
+
+@router.callback_query(F.data.startswith("delete_sub:"))
+async def delete_subscription(callback: CallbackQuery, state):
+    folder_path = callback.data.split("delete_sub:")[1]
+
+    async with async_session() as session:
+        user_result = await session.execute(select(User).where(User.tg_id == callback.from_user.id))
+        user = user_result.scalar_one_or_none()
+        if not user:
+            await callback.answer("❌ Пользователь не найден.")
+            return
+
+        await session.execute(delete(FolderSubscription).where(
+            FolderSubscription.user_id == user.id,
+            FolderSubscription.folder_path == folder_path
+        ))
+        await session.commit()
+
+    # Обновляем список подписок в state
+    data = await state.get_data()
+    subs = [s for s in data.get("subs", []) if s != folder_path]
+    await state.update_data(subs=subs)
+    await callback.answer(f"✅ Подписка на {folder_path} удалена.")
+    await show_subs_page(callback, state)
 
 
 # ---------------- Monitoring ----------------

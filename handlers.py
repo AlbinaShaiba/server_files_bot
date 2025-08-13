@@ -234,8 +234,12 @@ async def show_subs_page(message_or_callback, state: FSMContext):
 
     page_items, total = paginate_items(subs, page)
     kb = InlineKeyboardBuilder()
+    hash_map = {}
+
     for s in page_items:
-        kb.button(text=f"❌ {s}", callback_data=f"delete_sub:{s}")
+        h = make_callback_hash(s)
+        hash_map[h] = s
+        kb.button(text=f"❌ {s}", callback_data=f"delete_sub:{h}")
 
     if page > 1:
         kb.button(text="⬅️ Назад", callback_data="subs_page_prev")
@@ -243,6 +247,7 @@ async def show_subs_page(message_or_callback, state: FSMContext):
         kb.button(text="➡️ Вперёд", callback_data="subs_page_next")
 
     kb.adjust(1)
+    await state.update_data(hash_map_subs=hash_map, page=page)
     await safe_edit(message_or_callback, "Ваши подписки (нажмите для удаления):", reply_markup=kb.as_markup())
 
 # ---------------- Sub Pagination ----------------
@@ -261,7 +266,13 @@ async def subs_paginate_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("delete_sub:"))
 async def delete_subscription(callback: CallbackQuery, state: FSMContext):
-    folder_path = callback.data.split("delete_sub:")[1]
+    h = callback.data.split("delete_sub:")[1]
+    data = await state.get_data()
+    folder_path = data.get("hash_map_subs", {}).get(h)
+    if not folder_path:
+        await callback.answer("❌ Подписка не найдена.", show_alert=True)
+        return
+
     async with async_session() as session:
         user_result = await session.execute(select(User).where(User.tg_id == callback.from_user.id))
         user = user_result.scalar_one()
@@ -270,9 +281,8 @@ async def delete_subscription(callback: CallbackQuery, state: FSMContext):
             FolderSubscription.folder_path == folder_path
         ))
         await session.commit()
-    data = await state.get_data()
-    subs = data.get("subs", [])
-    subs = [s for s in subs if s != folder_path]
+
+    subs = [s for s in data.get("subs", []) if s != folder_path]
     await state.update_data(subs=subs)
     await callback.answer(f"❌ Подписка удалена: {folder_path}")
     await show_subs_page(callback, state)

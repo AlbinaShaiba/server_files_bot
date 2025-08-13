@@ -123,7 +123,10 @@ async def project_selected(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(selected_project=project)
     stages_path = os.path.join(FILES_ROOT, project)
-    stages = sorted([d for d in os.listdir(stages_path) if os.path.isdir(os.path.join(stages_path, d))])
+    stages = sorted([
+        d for d in os.listdir(stages_path)
+        if os.path.isdir(os.path.join(stages_path, d)) and d.lower() != "bim"
+    ])
 
     if not stages:
         await callback.message.edit_text("❌ Нет доступных стадий для проекта.")
